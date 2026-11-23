@@ -214,7 +214,7 @@ def analyze(series: pd.Series, ltp: float) -> dict:
     signals = [(1 if ltp > out[f"SMA{w}"] else -1)
                for w in SMA_WINDOWS if out[f"SMA{w}"] is not None]
     if out["RSI"] is not None:
-        signals.append(1 if out["RSI"] < 30 else -1 if out["RSI"] > 70 else 0)
+        signals.append(1 if out["RSI"] >= 60 else -1 if out["RSI"] <= 40 else 0)
     out["Rating"] = rate(sum(signals) / len(signals)) if signals else "N/A"
     return out
 
@@ -424,7 +424,7 @@ def technicals():
 
     st.caption(
         "Rating = average of signals: price vs 20/89/200-SMA (+1 above, −1 below) and "
-        f"RSI({RSI_PERIOD}) (+1 if < 30, −1 if > 70, else 0). Score ≥ 0.5 Strong Buy, "
+        f"RSI({RSI_PERIOD}) (+1 if ≥ 60, −1 if ≤ 40, else 0). Score ≥ 0.5 Strong Buy, "
         "≥ 0.2 Buy, between −0.2 and 0.2 Neutral, ≤ −0.2 Sell, ≤ −0.5 Strong Sell. "
         "This is a simplified score, not TradingView's multi-indicator rating, so labels "
         "can differ. 2H/4H bars are resampled from Yahoo's 1H data (last ~60 days); "
@@ -435,3 +435,17 @@ def technicals():
 live_table()
 st.subheader("Technicals")
 technicals()
+
+st.divider()
+st.caption(
+    "**Disclaimer:** This dashboard is for informational and educational purposes only and "
+    "does not constitute investment, trading, financial or legal advice, or a recommendation "
+    "or solicitation to buy or sell any security, commodity or derivative. Data is sourced "
+    "from Yahoo Finance, may be delayed, incomplete or inaccurate, and is not guaranteed. "
+    "INR copper prices are calculated approximations and may differ from actual MCX prices. "
+    "Technical ratings are simplified, rule-based calculations and are not predictions of "
+    "future performance. Futures and commodities trading involves substantial risk of loss "
+    "and is not suitable for every investor. Verify all prices with your broker or the "
+    "exchange before making any trading decision. Past performance is not indicative of "
+    "future results."
+)
