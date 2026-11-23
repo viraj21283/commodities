@@ -1,5 +1,5 @@
 """
-Live Futures Dashboard (Streamlit)
+Live Commodities Futures Dashboard (Streamlit)
 Run:  streamlit run app.py
 """
 
@@ -9,7 +9,7 @@ import pandas as pd
 import streamlit as st
 import yfinance as yf
 
-st.set_page_config(page_title="Futures Dashboard", layout="wide")
+st.set_page_config(page_title="Commodities Futures Dashboard", layout="wide")
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -344,7 +344,7 @@ def build_technicals() -> dict:
 # ---------------------------------------------------------------------------
 # UI
 # ---------------------------------------------------------------------------
-st.title("Futures Dashboard")
+st.title("Commodities Futures Dashboard")
 
 
 @st.fragment(run_every=REFRESH_SECONDS)
