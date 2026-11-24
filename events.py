@@ -335,7 +335,8 @@ tzname = pd.Timestamp.now(tz=zone).tzname()
 today = pd.Timestamp.now(tz=zone).date()
 
 f1, f2, f3 = st.columns([2.2, 1.3, 2])
-importance_pick = f1.radio("Importance", ["All", VI, IMP, NOT], horizontal=True)
+importance_pick = f1.pills("Importance", [VI, IMP, NOT], selection_mode="multi",
+                           default=[VI, IMP, NOT], format_func=lambda k: f"{BADGE[k]} {k}")
 range_pick = f2.selectbox("Date range", ["Today", "Next 7 days", "Next 30 days", "All upcoming"],
                           index=1)
 affects_pick = f3.multiselect("Affects", NAMES, default=NAMES)
@@ -355,7 +356,7 @@ counts = {k: sum(1 for e in ranged if e["importance"] == k) for k in (VI, IMP, N
 st.caption(f"{BADGE[VI]} {counts[VI]} very important · {BADGE[IMP]} {counts[IMP]} important · "
            f"{BADGE[NOT]} {counts[NOT]} not that important · times in {tzname}")
 
-shown = [e for e in ranged if importance_pick in ("All", e["importance"])]
+shown = [e for e in ranged if not importance_pick or e["importance"] in importance_pick]
 
 if feed_pending:
     st.info("Next week's macro calendar has not been published by the feed provider yet "
