@@ -212,7 +212,7 @@ def build_main_table():
     disp, rsi_num, chg_num = [], [], []
     for r in rows:
         c = r["inst"]["ccy"]
-        d = r["inst"]["dec"]
+        d = r["inst"].get("dec", 2)
         disp.append({
             "Name": r["inst"]["name"],
             "Symbol": r["inst"]["symbol"],
@@ -305,7 +305,7 @@ def live_table():
         f"Now: {clocks} · refreshes every {REFRESH_SECONDS}s · "
         f"⚠ = last quote older than {STALE_MINUTES} min (market may be closed)"
     )
-    units = " · ".join(f"{i['name']}: {i['unit']}" for i in INSTRUMENTS)
+    units = " · ".join(f"{i['name']}: {i.get('unit', '')}" for i in INSTRUMENTS)
     st.caption(
         f"Front-month futures (USD/INR is the spot rate). Units: {units}. "
         "SMAs/RSI use daily closes with today's bar set to LTP. "
@@ -335,7 +335,7 @@ def technicals():
     with st.expander("Indicator details (price, RSI and SMAs per timeframe)"):
         pick = st.selectbox("Instrument", list(results), key="detail_pick")
         cfg = next(i for i in INSTRUMENTS if i["name"] == pick)
-        ccy, dec = cfg["ccy"], cfg["dec"]
+        ccy, dec = cfg["ccy"], cfg.get("dec", 2)
         detail = []
         for tf in TIMEFRAMES:
             a = results[pick].get(tf)

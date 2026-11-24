@@ -194,15 +194,18 @@ NO_RELEASE_DATES = {date(2026, 12, 25), date(2027, 1, 1)}   # US holidays on a F
 @st.cache_data(ttl=FEED_TTL, show_spinner=False)
 def fetch_feed():
     """Raw events from the free weekly macro-calendar feed (this week + next week)."""
-    events, errors = [], []
+    events, errors, pending = [], [], []
     for label, url in FEED_URLS.items():
         try:
             r = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=10)
+            if r.status_code == 404 and label == "next week":
+                pending.append(label)   # not published yet: normal early in the week
+                continue
             r.raise_for_status()
             events.extend(r.json())
-        except Exception as e:
-            errors.append(f"{label}: {e}")
-    return events, errors
+        except Exception as ex:
+            errors.append(f"{label}: {ex}")
+    return events, errors, pending
 
 
 def make_event(**kw) -> dict:
@@ -282,7 +285,7 @@ def recurring_events(start: date, end: date) -> list:
 
 
 def build_events():
-    raw, errors = fetch_feed()
+    raw, errors, pending = fetch_feed()
     feed, coverage_end = parse_feed(raw)
     curated = curated_events()
 
@@ -293,7 +296,7 @@ def build_events():
     rec_start = max(today_et, coverage_end + timedelta(days=1)) if coverage_end else today_et
     recurring = recurring_events(rec_start, today_et + timedelta(days=RECURRING_HORIZON_DAYS))
 
-    return feed + curated + recurring, errors
+    return feed + curated + recurring, errors, pending
 
 
 # ---------------------------------------------------------------------------
@@ -338,7 +341,7 @@ range_pick = f2.selectbox("Date range", ["Today", "Next 7 days", "Next 30 days",
 affects_pick = f3.multiselect("Affects", NAMES, default=NAMES)
 view = st.segmented_control("View", ["Table", "Agenda"], default="Table") or "Table"
 
-events, feed_errors = build_events()
+events, feed_errors, feed_pending = build_events()
 events = localize(events, zone)
 
 end = {"Today": today, "Next 7 days": today + timedelta(days=6),
@@ -353,6 +356,11 @@ st.caption(f"{BADGE[VI]} {counts[VI]} very important · {BADGE[IMP]} {counts[IMP
            f"{BADGE[NOT]} {counts[NOT]} not that important · times in {tzname}")
 
 shown = [e for e in ranged if importance_pick in ("All", e["importance"])]
+
+if feed_pending:
+    st.info("Next week's macro calendar has not been published by the feed provider yet "
+            "(it usually appears later in the week). Scheduled events (Fed, jobs, OPEC+) and "
+            "typical weekly releases are shown for those days; check back for the full list.")
 
 if feed_errors:
     st.warning("Live macro feed unavailable for: " + "; ".join(feed_errors) +
