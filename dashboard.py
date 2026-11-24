@@ -60,9 +60,11 @@ def get_quote(ticker: str) -> dict:
         pass
 
     if any(v is None or pd.isna(v) for v in q.values()):
-        h = t.history(period="5d", interval="1d", auto_adjust=False).dropna(subset=["Close"])
-        if len(h) >= 2:
-            last, prev = h.iloc[-1], h.iloc[-2]
+        h = t.history(period="5d", interval="1d", auto_adjust=False)
+        h = h.dropna(subset=["Close"]) if "Close" in h else h.iloc[0:0]
+        if len(h) >= 1:
+            last = h.iloc[-1]
+            prev = h.iloc[-2] if len(h) >= 2 else last
             q["ltp"] = q["ltp"] if pd.notna(q["ltp"]) else last["Close"]
             q["prev"] = q["prev"] if pd.notna(q["prev"]) else prev["Close"]
             q["open"] = q["open"] if pd.notna(q["open"]) else last["Open"]
@@ -88,7 +90,14 @@ def get_quote_time(ticker: str):
 
 def get_snapshot(inst: dict) -> dict:
     q = get_quote(inst["yf"])
-    return {k: float(q[k]) for k in ("ltp", "prev", "open", "high", "low")}
+
+    def num(v):
+        return None if v is None or pd.isna(v) else float(v)
+
+    snap = {k: num(q[k]) for k in ("ltp", "prev", "open", "high", "low")}
+    if snap["ltp"] is None or snap["prev"] is None:
+        raise ValueError(f"Yahoo returned no price data for {inst['yf']}")
+    return snap
 
 
 def get_series(ticker: str, tf: str) -> pd.Series:
