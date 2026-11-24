@@ -14,6 +14,8 @@ ET = ZoneInfo("America/New_York")
 
 VI, IMP, NOT = "Very Important", "Important", "Not that important"
 BADGE = {VI: "🔴", IMP: "🟠", NOT: "⚪"}
+IMP_STYLE = {VI: "color: #d93025; font-weight: 700", IMP: "color: #e8710a; font-weight: 600",
+             NOT: "color: #8a8f98"}
 
 FEED_URLS = {
     "this week": "https://nfs.faireconomy.media/ff_calendar_thisweek.json",
@@ -333,7 +335,7 @@ importance_pick = f1.radio("Importance", ["All", VI, IMP, NOT], horizontal=True)
 range_pick = f2.selectbox("Date range", ["Today", "Next 7 days", "Next 30 days", "All upcoming"],
                           index=1)
 affects_pick = f3.multiselect("Affects", NAMES, default=NAMES)
-view = st.segmented_control("View", ["Agenda", "Table"], default="Agenda") or "Agenda"
+view = st.segmented_control("View", ["Table", "Agenda"], default="Table") or "Table"
 
 events, feed_errors = build_events()
 events = localize(events, zone)
@@ -369,7 +371,13 @@ elif view == "Table":
         "Previous": e["previous"],
         "Source": e["source"],
     } for e in shown])
-    st.dataframe(df, hide_index=True, width="stretch")
+    # st.table wraps long text so every cell is fully visible
+    styled = df.style.apply(
+        lambda _col: [IMP_STYLE[e["importance"]] for e in shown], subset=["Importance"])
+    try:
+        st.table(styled, hide_index=True)
+    except TypeError:   # older Streamlit without hide_index
+        st.table(styled.hide(axis="index"))
 else:
     current = None
     for e in shown:
