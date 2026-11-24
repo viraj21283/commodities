@@ -162,14 +162,14 @@ def analyze(series: pd.Series, ltp: float) -> dict:
 # ---------------------------------------------------------------------------
 # Formatting helpers
 # ---------------------------------------------------------------------------
-def money(v, ccy):
-    return "—" if v is None or pd.isna(v) else f"{ccy}{v:,.2f}"
+def money(v, ccy, dec=2):
+    return "—" if v is None or pd.isna(v) else f"{ccy}{v:,.{dec}f}"
 
 
-def signed_money(v, ccy):
+def signed_money(v, ccy, dec=2):
     if v is None or pd.isna(v):
         return "—"
-    return f"-{ccy}{abs(v):,.2f}" if v < 0 else f"{ccy}{v:,.2f}"
+    return f"-{ccy}{abs(v):,.{dec}f}" if v < 0 else f"{ccy}{v:,.{dec}f}"
 
 
 def fmt_time(ts, zone: ZoneInfo) -> str:
@@ -212,19 +212,20 @@ def build_main_table():
     disp, rsi_num, chg_num = [], [], []
     for r in rows:
         c = r["inst"]["ccy"]
+        d = r["inst"]["dec"]
         disp.append({
             "Name": r["inst"]["name"],
             "Symbol": r["inst"]["symbol"],
-            "Previous Close": money(r["prev"], c),
-            "LTP": money(r["ltp"], c),
-            "Change": signed_money(r["change"], c),
+            "Previous Close": money(r["prev"], c, d),
+            "LTP": money(r["ltp"], c, d),
+            "Change": signed_money(r["change"], c, d),
             "% Change": f"{r['pct']:.2f}%",
-            "Open": money(r["open"], c),
-            "Day High": money(r["high"], c),
-            "Day Low": money(r["low"], c),
-            "20-SMA": money(r["sma20"], c),
-            "89-SMA": money(r["sma89"], c),
-            "200-SMA": money(r["sma200"], c),
+            "Open": money(r["open"], c, d),
+            "Day High": money(r["high"], c, d),
+            "Day Low": money(r["low"], c, d),
+            "20-SMA": money(r["sma20"], c, d),
+            "89-SMA": money(r["sma89"], c, d),
+            "200-SMA": money(r["sma200"], c, d),
             "Daily RSI": "—" if r["rsi"] is None else f"{r['rsi']:.1f}",
             time_col: fmt_time(r["qtime"], zone),
         })
@@ -304,9 +305,9 @@ def live_table():
         f"Now: {clocks} · refreshes every {REFRESH_SECONDS}s · "
         f"⚠ = last quote older than {STALE_MINUTES} min (market may be closed)"
     )
-    units = " · ".join(f"{i['name']}: USD per {i['unit']}" for i in INSTRUMENTS)
+    units = " · ".join(f"{i['name']}: {i['unit']}" for i in INSTRUMENTS)
     st.caption(
-        f"All prices in USD, front-month futures. Units: {units}. "
+        f"Front-month futures (USD/INR is the spot rate). Units: {units}. "
         "SMAs/RSI use daily closes with today's bar set to LTP. "
         "RSI tint: green ≥ 60, red ≤ 40. Data: Yahoo Finance (may be delayed)."
     )
@@ -333,7 +334,8 @@ def technicals():
 
     with st.expander("Indicator details (price, RSI and SMAs per timeframe)"):
         pick = st.selectbox("Instrument", list(results), key="detail_pick")
-        ccy = next(i["ccy"] for i in INSTRUMENTS if i["name"] == pick)
+        cfg = next(i for i in INSTRUMENTS if i["name"] == pick)
+        ccy, dec = cfg["ccy"], cfg["dec"]
         detail = []
         for tf in TIMEFRAMES:
             a = results[pick].get(tf)
@@ -342,11 +344,11 @@ def technicals():
                 continue
             detail.append({
                 "Timeframe": TF_LABELS[tf],
-                "Price": money(a["Price"], ccy),
+                "Price": money(a["Price"], ccy, dec),
                 f"RSI({RSI_PERIOD})": "—" if a["RSI"] is None else f"{a['RSI']:.1f}",
-                "20-SMA": money(a["SMA20"], ccy),
-                "89-SMA": money(a["SMA89"], ccy),
-                "200-SMA": money(a["SMA200"], ccy),
+                "20-SMA": money(a["SMA20"], ccy, dec),
+                "89-SMA": money(a["SMA89"], ccy, dec),
+                "200-SMA": money(a["SMA200"], ccy, dec),
                 "Rating": a["Rating"],
             })
         st.dataframe(

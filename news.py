@@ -15,14 +15,16 @@ NEWS_TTL = 300               # seconds between feed refreshes
 MAX_PER_COMMODITY = 15
 MAX_SHOWN = 60
 GOOGLE_NEWS = "https://news.google.com/rss/search"
-GOLDSILVER_FEED = "https://goldsilver.com/industry-news/rss/"
+ZEROHEDGE_FEEDS = [
+    "https://cms.zerohedge.com/fullrss2.xml",
+    "https://feeds.feedburner.com/zerohedge/feed",
+]
 LOOKBACKS = {"Last 24 hours": "1d", "Last 3 days": "3d", "Last 7 days": "7d"}
 HEADERS = {"User-Agent": "Mozilla/5.0"}
 
 # Only headlines from these publishers are shown (domain -> label).
 # Edit this list to add or remove sources.
 TRUSTED_SOURCES = {
-    "goldsilver.com": "GoldSilver",
     "kitco.com": "Kitco",
     "reuters.com": "Reuters",
     "bloomberg.com": "Bloomberg",
@@ -42,10 +44,12 @@ TRUSTED_SOURCES = {
     "argusmedia.com": "Argus Media",
     "fastmarkets.com": "Fastmarkets",
     "eia.gov": "U.S. EIA",
+    "zerohedge.com": "ZeroHedge",
 }
 SITE_CLAUSE = " OR ".join(f"site:{d}" for d in TRUSTED_SOURCES)
 
-# Used to tag GoldSilver.com articles (read directly from its RSS feed)
+# Used to tag ZeroHedge articles (read directly from its RSS feed; it covers all topics,
+# so only articles matching a tracked instrument are kept)
 COMMODITY_PATTERNS = {
     "Gold": r"\bgold\b",
     "Silver": r"\bsilver\b",
@@ -53,6 +57,8 @@ COMMODITY_PATTERNS = {
     "Brent Crude": r"\bbrent\b|\bcrude\b|\boil\b",
     "Natural Gas": r"natural gas|\blng\b",
     "Copper": r"\bcopper\b",
+    "Dollar Index (DXY)": r"dollar index|\bdxy\b|\bgreenback\b|\bdollar\b",
+    "USD/INR": r"\busd/inr\b|\busdinr\b|\brupee\b|\binr\b",
 }
 
 EPOCH = pd.Timestamp(0, tz="UTC")
@@ -63,9 +69,12 @@ def parse_ts(pub):
         return None
     try:
         ts = pd.Timestamp(parsedate_to_datetime(pub))
-        return ts.tz_localize("UTC") if ts.tzinfo is None else ts.tz_convert("UTC")
     except Exception:
-        return None
+        try:
+            ts = pd.Timestamp(pub)
+        except Exception:
+            return None
+    return ts.tz_localize("UTC") if ts.tzinfo is None else ts.tz_convert("UTC")
 
 
 def trusted_label(url: str):
@@ -112,28 +121,33 @@ def fetch_news(query: str, lookback: str) -> list[dict]:
 
 
 @st.cache_data(ttl=NEWS_TTL, show_spinner=False)
-def fetch_goldsilver() -> list[dict]:
-    """Latest articles straight from GoldSilver.com's own RSS feed."""
-    resp = requests.get(GOLDSILVER_FEED, headers=HEADERS, timeout=10)
-    resp.raise_for_status()
-    root = ET.fromstring(resp.content)
-    items = []
-    for item in root.iter("item"):
-        title = (item.findtext("title") or "").strip()
-        link = (item.findtext("link") or "").strip()
-        if not title or not link:
+def fetch_zerohedge() -> list[dict]:
+    """Latest articles straight from ZeroHedge's own RSS feed."""
+    last_error = None
+    for url in ZEROHEDGE_FEEDS:
+        try:
+            resp = requests.get(url, headers=HEADERS, timeout=10)
+            resp.raise_for_status()
+            root = ET.fromstring(resp.content)
+        except Exception as e:
+            last_error = e
             continue
-        desc = re.sub(r"<[^>]+>", " ", item.findtext("description") or "")
-        items.append({"title": title, "link": link, "source": "GoldSilver",
-                      "ts": parse_ts(item.findtext("pubDate")), "text": f"{title} {desc}"})
-    return items
+        items = []
+        for item in root.iter("item"):
+            title = (item.findtext("title") or "").strip()
+            link = (item.findtext("link") or "").strip()
+            if not title or not link:
+                continue
+            desc = re.sub(r"<[^>]+>", " ", item.findtext("description") or "")
+            items.append({"title": title, "link": link, "source": "ZeroHedge",
+                          "ts": parse_ts(item.findtext("pubDate")), "text": f"{title} {desc}"})
+        return items
+    raise last_error or RuntimeError("no feed available")
 
 
-def goldsilver_tags(text: str) -> list[str]:
+def direct_tags(text: str) -> list[str]:
     names = {i["name"] for i in INSTRUMENTS}
-    tags = [n for n, p in COMMODITY_PATTERNS.items() if n in names and re.search(p, text, re.I)]
-    # GoldSilver is a precious-metals publisher: default macro pieces to gold and silver
-    return tags or [n for n in ("Gold", "Silver") if n in names]
+    return [n for n, p in COMMODITY_PATTERNS.items() if n in names and re.search(p, text, re.I)]
 
 
 def collect(selected: tuple, lookback: str):
@@ -161,14 +175,14 @@ def collect(selected: tuple, lookback: str):
             errors.append(f"{inst['name']} (Google News): {e}")
 
     try:
-        for it in fetch_goldsilver():
+        for it in fetch_zerohedge():
             if it["ts"] is not None and it["ts"] < limit:
                 continue
-            for tag in goldsilver_tags(it["text"]):
+            for tag in direct_tags(it["text"]):
                 if tag in selected:
                     add(it, tag)
     except Exception as e:
-        errors.append(f"GoldSilver.com feed: {e}")
+        errors.append(f"ZeroHedge feed: {e}")
 
     stories = sorted(merged.values(), key=lambda x: x["ts"] if x["ts"] is not None else EPOCH,
                      reverse=True)
@@ -235,7 +249,7 @@ keyword = c3.text_input("Filter headlines", placeholder="e.g. Fed, OPEC, tariffs
 with st.expander(f"Sources ({len(TRUSTED_SOURCES)} trusted publishers)"):
     sources = st.multiselect("Show headlines from", list(TRUSTED_SOURCES.values()),
                              default=list(TRUSTED_SOURCES.values()))
-st.button("Refresh now", on_click=lambda: (fetch_news.clear(), fetch_goldsilver.clear()))
+st.button("Refresh now", on_click=lambda: (fetch_news.clear(), fetch_zerohedge.clear()))
 
 if not selected:
     st.info("Select at least one commodity.")
@@ -246,7 +260,7 @@ else:
 
 st.caption(
     "Only headlines from a curated list of publishers that commodity traders follow are shown. "
-    "GoldSilver.com is read directly from its own news feed; the others come via Google News "
-    "search. Headlines are not verified or endorsed here; open the original article for full "
-    "context."
+    "ZeroHedge is read directly from its own news feed (it is an opinionated, contrarian "
+    "blog, so treat it as commentary); the others come via Google News search. Headlines are "
+    "not verified or endorsed here; open the original article for full context."
 )

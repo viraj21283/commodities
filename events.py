@@ -37,6 +37,7 @@ OIL = pick("WTI Crude", "Brent Crude")
 GAS = pick("Natural Gas")
 COPPER = pick("Copper")
 ALL = list(NAMES)
+FX = pick("Dollar Index (DXY)", "USD/INR")
 
 # ---------------------------------------------------------------------------
 # Classification rules for events from the live feed (first match wins).
@@ -45,7 +46,7 @@ ALL = list(NAMES)
 # key       : used to de-duplicate against the curated list below
 # ---------------------------------------------------------------------------
 RULES = [
-    dict(pat=r"\badp\b", countries={"USD"}, key="adp", imp=IMP, affects=GOLD_SILVER,
+    dict(pat=r"\badp\b", countries={"USD"}, key="adp", imp=IMP, affects=GOLD_SILVER + FX,
          why="Private payrolls estimate that previews the official jobs report; a big miss or "
              "beat can shift rate expectations."),
     dict(pat=r"federal funds rate|fomc statement|fomc economic projections", countries={"USD"},
@@ -56,7 +57,7 @@ RULES = [
          why="The Fed Chair's tone on future rate moves often shifts gold, silver and the dollar "
              "more than the decision itself."),
     dict(pat=r"fomc meeting minutes|fomc minutes", countries={"USD"}, key="fomc_minutes",
-         imp=IMP, affects=GOLD_SILVER,
+         imp=IMP, affects=GOLD_SILVER + FX,
          why="Shows how divided the Fed was and hints at the future rate path; moves the dollar "
              "and gold if the tone differs from expectations."),
     dict(pat=r"non-?farm", countries={"USD"}, key="nfp", imp=VI, affects=ALL,
@@ -65,15 +66,15 @@ RULES = [
     dict(pat=r"\bcpi\b", countries={"USD"}, key="cpi", imp=VI, affects=ALL,
          why="Inflation prints drive Fed policy bets and gold's inflation-hedge demand; a "
              "surprise moves the dollar, metals and energy."),
-    dict(pat=r"core pce|pce price", countries={"USD"}, key="pce", imp=IMP, affects=GOLD_SILVER,
+    dict(pat=r"core pce|pce price", countries={"USD"}, key="pce", imp=IMP, affects=GOLD_SILVER + FX,
          why="The Fed's preferred inflation gauge; shapes rate expectations and gold."),
-    dict(pat=r"\bppi\b", countries={"USD"}, key=None, imp=IMP, affects=GOLD_SILVER,
+    dict(pat=r"\bppi\b", countries={"USD"}, key=None, imp=IMP, affects=GOLD_SILVER + FX,
          why="Producer-price inflation is an early read on consumer inflation and Fed policy."),
     dict(pat=r"unemployment rate|average hourly earnings|participation rate", countries={"USD"},
-         key=None, imp=IMP, affects=GOLD_SILVER,
+         key=None, imp=IMP, affects=GOLD_SILVER + FX,
          why="Part of the labour data that shapes Fed rate expectations."),
     dict(pat=r"\bjolts\b|job openings", countries={"USD"}, key=None, imp=IMP,
-         affects=GOLD_SILVER,
+         affects=GOLD_SILVER + FX,
          why="Job openings gauge labour demand, an input to Fed policy views."),
     dict(pat=r"\bgdp\b", countries={"USD"}, key=None, imp=IMP, affects=ALL,
          why="Growth data affects rate expectations and the demand outlook for industrial "
@@ -81,7 +82,7 @@ RULES = [
     dict(pat=r"retail sales", countries={"USD"}, key=None, imp=IMP, affects=ALL,
          why="Consumer spending is a major growth driver; surprises shift rate expectations and "
              "demand for oil and metals."),
-    dict(pat=r"\bism\b", countries={"USD"}, key=None, imp=IMP, affects=COPPER + OIL + GOLD_SILVER,
+    dict(pat=r"\bism\b", countries={"USD"}, key=None, imp=IMP, affects=COPPER + OIL + GOLD_SILVER + FX,
          why="US factory and services activity gauge; reflects industrial demand for copper and "
              "oil and sways Fed expectations."),
     dict(pat=r"crude oil inventories", countries={"USD"}, key="eia_crude", imp=IMP, affects=OIL,
@@ -90,14 +91,14 @@ RULES = [
     dict(pat=r"natural gas storage", countries={"USD"}, key="eia_gas", imp=IMP, affects=GAS,
          why="The weekly storage build or draw versus expectations is the main short-term driver "
              "of natural gas prices."),
-    dict(pat=r"beige book", countries={"USD"}, key="beige", imp=IMP, affects=GOLD_SILVER,
+    dict(pat=r"beige book", countries={"USD"}, key="beige", imp=IMP, affects=GOLD_SILVER + FX,
          why="The Fed's anecdotal read on the economy; can nudge rate expectations ahead of FOMC "
              "meetings."),
-    dict(pat=r"fed chair", countries={"USD"}, key=None, imp=IMP, affects=GOLD_SILVER,
+    dict(pat=r"fed chair", countries={"USD"}, key=None, imp=IMP, affects=GOLD_SILVER + FX,
          why="Comments from the Fed Chair can shift rate expectations and move gold, silver and "
              "the dollar."),
     dict(pat=r"main refinancing rate|ecb press conference|monetary policy statement",
-         countries={"EUR"}, key=None, imp=IMP, affects=GOLD_SILVER,
+         countries={"EUR"}, key=None, imp=IMP, affects=GOLD_SILVER + FX,
          why="ECB policy drives EUR/USD, the dollar's largest component, and through it gold and "
              "dollar-priced commodities."),
     dict(pat=r"loan prime rate", countries={"CNY"}, key=None, imp=IMP, affects=COPPER + OIL,
@@ -111,7 +112,7 @@ RULES = [
          why="Industrial output, retail sales and trade data show the strength of Chinese demand "
              "for metals and energy."),
     dict(pat=r"inflation|\bcpi\b|\bhicp\b", countries=None, key=None, imp=IMP,
-         affects=GOLD_SILVER,
+         affects=GOLD_SILVER + FX,
          why="Inflation data abroad shifts central-bank expectations and currencies, which spill "
              "over to commodities."),
 ]
