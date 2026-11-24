@@ -27,7 +27,7 @@ INSTRUMENTS = [
      "unit": "USD per MMBtu", "news": '"natural gas futures" OR "natural gas prices"'},
     {"name": "Copper", "symbol": "HG", "yf": "HG=F", "ccy": "$", "dec": 2,
      "unit": "USD per lb", "news": '"copper price" OR "copper futures"'},
-    {"name": "Dollar Index (DXY)", "symbol": "DX", "yf": "DX=F", "ccy": "", "dec": 3,
+    {"name": "Dollar Index (DXY)", "symbol": "DX", "yf": "DX-Y.NYB", "ccy": "", "dec": 3,
      "unit": "index points", "news": '"dollar index" OR DXY'},
     {"name": "USD/INR", "symbol": "USDINR", "yf": "INR=X", "ccy": "₹", "dec": 4,
      "unit": "INR per USD, spot", "news": '"USD/INR" OR "Indian rupee" OR rupee'},
