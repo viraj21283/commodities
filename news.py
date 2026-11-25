@@ -1,6 +1,9 @@
 """News page: headlines from top sources that commodity traders follow."""
 
+import logging
 import re
+import threading
+import time
 import xml.etree.ElementTree as ET
 from email.utils import parsedate_to_datetime
 from urllib.parse import urlparse
@@ -11,7 +14,9 @@ import streamlit as st
 
 from common import INSTRUMENTS, esc_md, tz
 
-NEWS_TTL = 300               # seconds between feed refreshes
+NEWS_TTL = 600               # seconds a fetched result stays fresh
+MIN_GAP = 0.7                # seconds between outgoing requests (avoid rate limits)
+FAIL_COOLDOWN = 180          # after a failed fetch, wait this long before retrying
 MAX_PER_COMMODITY = 15
 MAX_SHOWN = 60
 GOOGLE_NEWS = "https://news.google.com/rss/search"
@@ -21,6 +26,7 @@ ZEROHEDGE_FEEDS = [
 ]
 LOOKBACKS = {"Last 24 hours": "1d", "Last 3 days": "3d", "Last 7 days": "7d"}
 HEADERS = {"User-Agent": "Mozilla/5.0"}
+log = logging.getLogger(__name__)
 
 # Only headlines from these publishers are shown (domain -> label).
 # Edit this list to add or remove sources.
@@ -90,16 +96,57 @@ def cutoff(lookback: str) -> pd.Timestamp:
     return pd.Timestamp.now(tz="UTC") - pd.Timedelta(days=int(LOOKBACKS[lookback][:-1]))
 
 
-@st.cache_data(ttl=NEWS_TTL, show_spinner=False)
-def fetch_news(query: str, lookback: str) -> list[dict]:
+@st.cache_resource
+def _store() -> dict:
+    """Shared across sessions: cached results, failure cooldowns and a request lock."""
+    return {"data": {}, "ts": {}, "fail_until": {}, "last_request": 0.0, "lock": threading.Lock()}
+
+
+def clear_news_cache():
+    s = _store()
+    with s["lock"]:
+        s["ts"].clear()
+        s["fail_until"].clear()
+
+
+def cached_fetch(key, fn) -> list:
+    """Rate-limit-friendly fetch: serves fresh cache, spaces out requests, and on any
+    failure quietly falls back to the last good result (never raises)."""
+    s = _store()
+    with s["lock"]:
+        now = time.time()
+        if key in s["data"] and now - s["ts"].get(key, 0) < NEWS_TTL:
+            return s["data"][key]
+        if now < s["fail_until"].get(key, 0):          # recently failed: don't hammer
+            return s["data"].get(key, [])
+        wait = MIN_GAP - (now - s["last_request"])
+        if wait > 0:
+            time.sleep(wait)
+        try:
+            data = fn()
+        except Exception as e:
+            log.warning("news fetch failed for %s: %s", key, e)
+            s["fail_until"][key] = time.time() + FAIL_COOLDOWN
+            return s["data"].get(key, [])               # stale data if we have it
+        finally:
+            s["last_request"] = time.time()
+        s["data"][key] = data
+        s["ts"][key] = time.time()
+        s["fail_until"].pop(key, None)
+        return data
+
+
+def _download_news(query: str, lookback: str) -> list[dict]:
     """Headlines for one search query, restricted to trusted publishers (Google News RSS)."""
-    resp = requests.get(
-        GOOGLE_NEWS,
-        params={"q": f"({query}) ({SITE_CLAUSE}) when:{LOOKBACKS[lookback]}",
-                "hl": "en-US", "gl": "US", "ceid": "US:en"},
-        headers=HEADERS, timeout=10,
-    )
-    resp.raise_for_status()
+    params = {"q": f"({query}) ({SITE_CLAUSE}) when:{LOOKBACKS[lookback]}",
+              "hl": "en-US", "gl": "US", "ceid": "US:en"}
+    for attempt in range(2):
+        resp = requests.get(GOOGLE_NEWS, params=params, headers=HEADERS, timeout=10)
+        if resp.status_code in (429, 503) and attempt == 0:
+            time.sleep(2.5)                              # brief back-off, then one retry
+            continue
+        resp.raise_for_status()
+        break
     root = ET.fromstring(resp.content)
 
     items = []
@@ -120,8 +167,11 @@ def fetch_news(query: str, lookback: str) -> list[dict]:
     return items[:MAX_PER_COMMODITY]
 
 
-@st.cache_data(ttl=NEWS_TTL, show_spinner=False)
-def fetch_zerohedge() -> list[dict]:
+def fetch_news(query: str, lookback: str) -> list[dict]:
+    return cached_fetch(("google", query, lookback), lambda: _download_news(query, lookback))
+
+
+def _download_zerohedge() -> list[dict]:
     """Latest articles straight from ZeroHedge's own RSS feed."""
     last_error = None
     for url in ZEROHEDGE_FEEDS:
@@ -145,6 +195,10 @@ def fetch_zerohedge() -> list[dict]:
     raise last_error or RuntimeError("no feed available")
 
 
+def fetch_zerohedge() -> list[dict]:
+    return cached_fetch(("zerohedge",), _download_zerohedge)
+
+
 def direct_tags(text: str) -> list[str]:
     names = {i["name"] for i in INSTRUMENTS}
     return [n for n, p in COMMODITY_PATTERNS.items() if n in names and re.search(p, text, re.I)]
@@ -153,7 +207,6 @@ def direct_tags(text: str) -> list[str]:
 def collect(selected: tuple, lookback: str):
     """Fetch, merge (same story under several commodities) and sort headlines."""
     merged: dict[str, dict] = {}
-    errors = []
     limit = cutoff(lookback)
 
     def add(item, tag):
@@ -166,27 +219,19 @@ def collect(selected: tuple, lookback: str):
                            "source": item["source"], "ts": item["ts"], "tags": [tag]}
 
     for inst in INSTRUMENTS:
-        if inst["name"] not in selected:
-            continue
-        try:
+        if inst["name"] in selected:
             for it in fetch_news(inst["news"], lookback):
                 add(it, inst["name"])
-        except Exception as e:
-            errors.append(f"{inst['name']} (Google News): {e}")
 
-    try:
-        for it in fetch_zerohedge():
-            if it["ts"] is not None and it["ts"] < limit:
-                continue
-            for tag in direct_tags(it["text"]):
-                if tag in selected:
-                    add(it, tag)
-    except Exception as e:
-        errors.append(f"ZeroHedge feed: {e}")
+    for it in fetch_zerohedge():
+        if it["ts"] is not None and it["ts"] < limit:
+            continue
+        for tag in direct_tags(it["text"]):
+            if tag in selected:
+                add(it, tag)
 
-    stories = sorted(merged.values(), key=lambda x: x["ts"] if x["ts"] is not None else EPOCH,
-                     reverse=True)
-    return stories, errors
+    return sorted(merged.values(), key=lambda x: x["ts"] if x["ts"] is not None else EPOCH,
+                  reverse=True)
 
 
 def ago(ts) -> str:
@@ -202,20 +247,16 @@ def ago(ts) -> str:
 
 @st.fragment(run_every=NEWS_TTL)
 def news_feed(selected: tuple, lookback: str, keyword: str, sources: tuple):
-    stories, errors = collect(selected, lookback)
+    stories = collect(selected, lookback)
     stories = [s for s in stories if s["source"] in sources]
 
     if keyword:
         k = keyword.lower()
         stories = [s for s in stories if k in s["title"].lower() or k in s["source"].lower()]
 
-    for err in errors:
-        st.warning(f"Could not load news for {err}")
-
     if not stories:
-        if not errors:
-            st.info("No headlines found for this selection. Try a longer time window or more "
-                    "sources.")
+        st.info("No headlines available for this selection right now. Try a longer time window "
+                "or more sources; this page retries automatically every few minutes.")
         return
 
     zone = tz()
@@ -249,7 +290,7 @@ keyword = c3.text_input("Filter headlines", placeholder="e.g. Fed, OPEC, tariffs
 with st.expander(f"Sources ({len(TRUSTED_SOURCES)} trusted publishers)"):
     sources = st.multiselect("Show headlines from", list(TRUSTED_SOURCES.values()),
                              default=list(TRUSTED_SOURCES.values()))
-st.button("Refresh now", on_click=lambda: (fetch_news.clear(), fetch_zerohedge.clear()))
+st.button("Refresh now", on_click=clear_news_cache)
 
 if not selected:
     st.info("Select at least one commodity.")
