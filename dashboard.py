@@ -2,6 +2,7 @@
 
 from zoneinfo import ZoneInfo
 
+import time
 from concurrent.futures import ThreadPoolExecutor
 
 import pandas as pd
@@ -33,18 +34,138 @@ RATING_STYLE = {
 # ---------------------------------------------------------------------------
 # Data layer
 # ---------------------------------------------------------------------------
-@st.cache_data(ttl=3600, show_spinner=False)
-def get_daily(ticker: str) -> pd.Series:
-    """Full daily history (needed for weekly/monthly 200-SMA)."""
-    h = yf.Ticker(ticker).history(period="max", interval="1d", auto_adjust=False)
-    return h["Close"].dropna()
+def _retry(fn):
+    """Run fn() up to twice; return None if it keeps failing."""
+    for _ in range(2):
+        try:
+            return fn()
+        except Exception:
+            continue
+    return None
+
+
+def _pmap(fn, items):
+    """Run fn over items in parallel threads (fn must not call Streamlit)."""
+    items = list(items)
+    if not items:
+        return []
+    with ThreadPoolExecutor(max_workers=8) as ex:
+        return list(ex.map(fn, items))
+
+
+def _close_series(h) -> pd.Series:
+    if h is not None and not h.empty and "Close" in h:
+        return h["Close"].dropna()
+    return pd.Series(dtype=float)
+
+
+def _dl_daily_max(t: str) -> pd.Series:
+    return _close_series(_retry(
+        lambda: yf.Ticker(t).history(period="max", interval="1d", auto_adjust=False)))
+
+
+def _dl_daily_recent(t: str) -> pd.Series:
+    return _close_series(_retry(
+        lambda: yf.Ticker(t).history(period="10d", interval="1d", auto_adjust=False)))
+
+
+def _dl_hourly(t: str) -> pd.Series:
+    return _close_series(_retry(
+        lambda: yf.Ticker(t).history(period="60d", interval="60m", auto_adjust=False)))
+
+
+def _dl_intraday(t: str) -> dict:
+    """Recent 1-minute bars (tz-aware index) plus Yahoo's chart metadata (live price etc.)."""
+    tk = yf.Ticker(t)
+    for period in ("2d", "5d"):
+        h = _retry(lambda: tk.history(period=period, interval="1m", auto_adjust=False))
+        if h is not None and not h.empty and "Close" in h:
+            h = h.dropna(subset=["Close"])
+            if not h.empty:
+                if h.index.tz is None:
+                    h.index = h.index.tz_localize("UTC")
+                try:
+                    meta = dict(tk.history_metadata or {})
+                except Exception:
+                    meta = {}
+                return {"bars": h[["Open", "High", "Low", "Close"]], "meta": meta}
+    return {"bars": pd.DataFrame(), "meta": {}}
+
+
+def _dl_fast(t: str) -> dict:
+    try:
+        return _fast_info_quote(t)
+    except Exception:
+        return {"ltp": None, "prev": None, "open": None, "high": None, "low": None}
+
+
+# Each batch fetches every instrument in parallel (one round trip instead of eight in a row),
+# so a refresh takes about a second and can never queue up behind slow requests.
+@st.cache_data(ttl=1800, show_spinner=False)
+def batch_daily(tickers: tuple) -> dict:
+    return dict(zip(tickers, _pmap(_dl_daily_max, tickers)))
 
 
 @st.cache_data(ttl=120, show_spinner=False)
-def get_hourly(ticker: str) -> pd.Series:
-    """~60 days of hourly closes (2H and 4H are resampled from this)."""
-    h = yf.Ticker(ticker).history(period="60d", interval="60m", auto_adjust=False)
-    return h["Close"].dropna()
+def batch_hourly(tickers: tuple) -> dict:
+    return dict(zip(tickers, _pmap(_dl_hourly, tickers)))
+
+
+@st.cache_data(ttl=600, show_spinner=False)
+def batch_recent_daily(tickers: tuple) -> dict:
+    return dict(zip(tickers, _pmap(_dl_daily_recent, tickers)))
+
+
+@st.cache_data(ttl=REFRESH_SECONDS, show_spinner=False)
+def batch_intraday(tickers: tuple) -> dict:
+    return dict(zip(tickers, _pmap(_dl_intraday, tickers)))
+
+
+@st.cache_data(ttl=REFRESH_SECONDS, show_spinner=False)
+def batch_fast(tickers: tuple) -> dict:
+    return dict(zip(tickers, _pmap(_dl_fast, tickers)))
+
+
+def clear_quote_cache():
+    batch_intraday.clear()
+    batch_fast.clear()
+
+
+def series_tickers() -> tuple:
+    return tuple(i["yf"] for i in INSTRUMENTS)
+
+
+def quote_tickers() -> tuple:
+    return tuple(quote_ticker(i) for i in INSTRUMENTS)
+
+
+def non_cme_tickers() -> tuple:
+    return tuple(quote_ticker(i) for i in INSTRUMENTS if not i.get("cme"))
+
+
+def _from(batch, tickers: tuple, t: str, single):
+    data = batch(tickers)
+    return data[t] if t in data else single(t)
+
+
+def get_daily(t: str) -> pd.Series:
+    return _from(batch_daily, series_tickers(), t, _dl_daily_max)
+
+
+def get_hourly(t: str) -> pd.Series:
+    return _from(batch_hourly, series_tickers(), t, _dl_hourly)
+
+
+def get_recent_daily(t: str) -> pd.Series:
+    return _from(batch_recent_daily, quote_tickers(), t, _dl_daily_recent)
+
+
+def get_intraday(t: str) -> dict:
+    return _from(batch_intraday, quote_tickers(), t, _dl_intraday)
+
+
+def get_fast(t: str) -> dict:
+    return _from(batch_fast, non_cme_tickers(), t, _dl_fast)
 
 
 MONTH_CODES = "FGHJKMNQUVXZ"
@@ -167,28 +288,6 @@ def display_symbol(inst: dict) -> str:
 # ---------------------------------------------------------------------------
 # Quotes
 # ---------------------------------------------------------------------------
-@st.cache_data(ttl=REFRESH_SECONDS, show_spinner=False)
-def get_intraday(ticker: str) -> dict:
-    """Recent 1-minute bars (tz-aware index) plus Yahoo's chart metadata."""
-    t = yf.Ticker(ticker)
-    for period in ("2d", "5d"):
-        try:
-            h = t.history(period=period, interval="1m", auto_adjust=False)
-        except Exception:
-            continue
-        if h is not None and not h.empty and "Close" in h:
-            h = h.dropna(subset=["Close"])
-            if not h.empty:
-                if h.index.tz is None:
-                    h.index = h.index.tz_localize("UTC")
-                try:
-                    meta = dict(t.history_metadata or {})
-                except Exception:
-                    meta = {}
-                return {"bars": h[["Open", "High", "Low", "Close"]], "meta": meta}
-    return {"bars": pd.DataFrame(), "meta": {}}
-
-
 def _session_values(bars: pd.DataFrame, ticker: str):
     """Open/High/Low of the current exchange session (6 PM ET to 5 PM ET) and the previous
     trading day's settlement (daily-bar close)."""
@@ -203,7 +302,7 @@ def _session_values(bars: pd.DataFrame, ticker: str):
 
     out = {"open": float(sess["Open"].iloc[0]), "high": float(sess["High"].max()),
            "low": float(sess["Low"].min()), "session_start": start}
-    daily = get_daily(ticker)
+    daily = get_recent_daily(ticker)
     if len(daily):
         mask = daily.index.date < trade_date
         if mask.any():
@@ -211,14 +310,12 @@ def _session_values(bars: pd.DataFrame, ticker: str):
     return out
 
 
-@st.cache_data(ttl=REFRESH_SECONDS, show_spinner=False)
 def get_quote(ticker: str, cme: bool = False) -> dict:
-    """Latest quote.
+    """Latest quote (all underlying downloads are cached for REFRESH_SECONDS).
 
     LTP is Yahoo's live price. For CME/NYMEX futures the previous close is the prior
     settlement and the day's range spans the whole exchange session (union of 1-minute bars
-    and Yahoo's own day high/low)."""
-    raw = _fast_info_quote(ticker)
+    and Yahoo's own day high/low). DXY and USD/INR use Yahoo's quote fields as-is."""
     data = get_intraday(ticker)
     bars, meta = data["bars"], data["meta"]
 
@@ -228,42 +325,50 @@ def get_quote(ticker: str, cme: bool = False) -> dict:
         meta_ts = pd.Timestamp(int(meta["regularMarketTime"]), unit="s", tz="UTC")
     stamps = [t for t in (bar_ts, meta_ts) if t is not None]
 
-    ltp = raw["ltp"]
-    if ltp is None:
-        ltp = _num(meta.get("regularMarketPrice"))
-    if ltp is None and not bars.empty:
-        ltp = float(bars["Close"].iloc[-1])
+    meta_px = _num(meta.get("regularMarketPrice"))
+    meta_hi = _num(meta.get("regularMarketDayHigh"))
+    meta_lo = _num(meta.get("regularMarketDayLow"))
+    meta_prev = _num(meta.get("chartPreviousClose"))
+    if meta_prev is None:
+        meta_prev = _num(meta.get("previousClose"))
+    bar_ltp = float(bars["Close"].iloc[-1]) if not bars.empty else None
 
-    q = {
-        "ltp": ltp, "prev": raw["prev"], "open": raw["open"], "high": raw["high"],
-        "low": raw["low"], "src": "Yahoo fast_info", "session_start": None,
-        "last_bar": max(stamps) if stamps else None,
-        "fi_prev": raw["prev"], "fi_ltp": raw["ltp"], "fi_high": raw["high"],
-        "fi_low": raw["low"],
-        "bar_ltp": float(bars["Close"].iloc[-1]) if not bars.empty else None,
-    }
+    q = {"session_start": None, "last_bar": max(stamps) if stamps else None,
+         "bar_ltp": bar_ltp}
 
-    if cme and not bars.empty:
-        try:
-            s = _session_values(bars, ticker)
-        except Exception:
-            s = None
-        if s:
-            highs = [v for v in (s["high"], raw["high"], _num(meta.get("regularMarketDayHigh")),
-                                 ltp) if v is not None]
-            lows = [v for v in (s["low"], raw["low"], _num(meta.get("regularMarketDayLow")),
-                                ltp) if v is not None]
-            q.update({"open": s["open"], "high": max(highs), "low": min(lows),
-                      "session_start": s["session_start"],
-                      "src": "Yahoo live price + exchange-session range/settlement"})
-            if s.get("prev") is not None:
-                q["prev"] = s["prev"]
+    if cme:
+        ltp = meta_px if meta_px is not None else bar_ltp
+        prev, opn, hi, lo = meta_prev, None, meta_hi, meta_lo
+        if ltp is None or prev is None:                  # rare: fall back to Yahoo's quote
+            fb = get_fast(ticker)
+            ltp = ltp if ltp is not None else fb["ltp"]
+            prev = prev if prev is not None else fb["prev"]
+            opn, hi, lo = fb["open"], hi if hi is not None else fb["high"], \
+                lo if lo is not None else fb["low"]
+        q.update({"fi_ltp": meta_px, "fi_prev": meta_prev, "fi_high": meta_hi,
+                  "fi_low": meta_lo, "src": "Yahoo live price"})
+        if not bars.empty:
+            try:
+                s = _session_values(bars, ticker)
+            except Exception:
+                s = None
+            if s:
+                highs = [v for v in (s["high"], hi, ltp) if v is not None]
+                lows = [v for v in (s["low"], lo, ltp) if v is not None]
+                hi, lo, opn = max(highs), min(lows), s["open"]
+                q["session_start"] = s["session_start"]
+                q["src"] = "Yahoo live price + exchange-session range/settlement"
+                if s.get("prev") is not None:
+                    prev = s["prev"]
+        q.update({"ltp": ltp, "prev": prev, "open": opn, "high": hi, "low": lo})
+    else:
+        raw = get_fast(ticker)
+        ltp = raw["ltp"] if raw["ltp"] is not None else (meta_px if meta_px is not None
+                                                          else bar_ltp)
+        q.update({"ltp": ltp, "prev": raw["prev"], "open": raw["open"], "high": raw["high"],
+                  "low": raw["low"], "fi_ltp": raw["ltp"], "fi_prev": raw["prev"],
+                  "fi_high": raw["high"], "fi_low": raw["low"], "src": "Yahoo fast_info"})
     return q
-
-
-def get_quote_time(ticker: str):
-    """Timestamp (tz-aware) of Yahoo's latest data point for this ticker, or None."""
-    return get_quote(ticker, False)["last_bar"]
 
 
 @st.cache_data(ttl=21600, show_spinner=False)
@@ -394,7 +499,7 @@ def build_main_table():
                 "open": snap["open"], "high": snap["high"], "low": snap["low"],
                 "sma20": a["SMA20"], "sma89": a["SMA89"], "sma200": a["SMA200"],
                 "rsi": a["RSI"],
-                "qtime": get_quote_time(quote_ticker(inst)),
+                "qtime": get_quote(quote_ticker(inst), bool(inst.get("cme", False)))["last_bar"],
             })
         except Exception as e:
             st.warning(f"Could not fetch {inst['name']} ({inst['yf']}): {e}")
@@ -482,11 +587,19 @@ st.title("Commodities Futures Dashboard")
 
 @st.fragment(run_every=REFRESH_SECONDS)
 def live_table():
-    disp, nums = build_main_table()
+    started = time.time()
+    try:
+        disp, nums = build_main_table()
+    except Exception:
+        # never let one bad refresh stop the auto-refresh timer
+        st.warning("Prices could not be refreshed just now; retrying automatically.")
+        return
     if disp is None:
         st.error("No data available right now.")
         return
+    took = time.time() - started
     st.dataframe(style_main(disp, nums), hide_index=True, width="stretch")
+    st.button("Refresh now", key="refresh_now", on_click=clear_quote_cache)
 
     zone = tz()
     now = pd.Timestamp.now(tz="UTC")
@@ -495,7 +608,7 @@ def live_table():
         for z in (zone, ZoneInfo("UTC"), ZoneInfo("America/New_York"))
     )
     st.caption(
-        f"Now: {clocks} · refreshes every {REFRESH_SECONDS}s · "
+        f"Last refresh: {clocks} (took {took:.1f}s) · auto-refreshes every {REFRESH_SECONDS}s · "
         f"⚠ = last quote older than {STALE_MINUTES} min (market may be closed)"
     )
     units = " · ".join(f"{i['name']}: {i.get('unit', '')}" for i in INSTRUMENTS)
