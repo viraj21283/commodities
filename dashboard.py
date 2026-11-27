@@ -132,7 +132,8 @@ def get_quote(ticker: str, cme: bool = False) -> dict:
     """Latest quote. CME/NYMEX futures use session-based values; others use Yahoo's fields."""
     q = _fast_info_quote(ticker)
     q.update({"src": "Yahoo fast_info", "session_start": None, "last_bar": None,
-              "fi_prev": q["prev"]})
+              "fi_prev": q["prev"], "fi_ltp": q["ltp"], "fi_high": q["high"],
+              "fi_low": q["low"]})
     if cme:
         try:
             sess = _session_quote(ticker)
@@ -162,8 +163,14 @@ def get_contract_name(ticker: str) -> str:
         return "—"
 
 
+def quote_ticker(inst: dict) -> str:
+    """Ticker used for live quote values. Set "quote" in common.py (e.g. "SIZ26.CMX") to pin
+    a specific contract month; otherwise Yahoo's continuous front-month ticker is used."""
+    return inst.get("quote") or inst["yf"]
+
+
 def get_snapshot(inst: dict) -> dict:
-    q = get_quote(inst["yf"], bool(inst.get("cme", False)))
+    q = get_quote(quote_ticker(inst), bool(inst.get("cme", False)))
 
     def num(v):
         return None if v is None or pd.isna(v) else float(v)
@@ -284,7 +291,7 @@ def build_main_table():
                 "open": snap["open"], "high": snap["high"], "low": snap["low"],
                 "sma20": a["SMA20"], "sma89": a["SMA89"], "sma200": a["SMA200"],
                 "rsi": a["RSI"],
-                "qtime": get_quote_time(inst["yf"]),
+                "qtime": get_quote_time(quote_ticker(inst)),
             })
         except Exception as e:
             st.warning(f"Could not fetch {inst['name']} ({inst['yf']}): {e}")
@@ -403,21 +410,25 @@ def live_table():
         rows = []
         for inst in INSTRUMENTS:
             try:
-                q = get_quote(inst["yf"], bool(inst.get("cme", False)))
+                qt = quote_ticker(inst)
+                q = get_quote(qt, bool(inst.get("cme", False)))
                 c, dec = inst["ccy"], inst.get("dec", 2)
                 last = q["last_bar"]
                 age = ("—" if last is None else
                        f"{(pd.Timestamp.now(tz='UTC') - last).total_seconds() / 60:.0f} min")
                 rows.append({
                     "Name": inst["name"],
-                    "Yahoo ticker": inst["yf"],
-                    "Contract priced": get_contract_name(inst["yf"]),
+                    "Yahoo ticker": qt,
+                    "Contract priced": get_contract_name(qt),
                     "LTP": money(q["ltp"], c, dec),
+                    "Yahoo raw LTP": money(q["fi_ltp"], c, dec),
                     "Previous close used": money(q["prev"], c, dec),
-                    "Yahoo prev close (raw)": money(q["fi_prev"], c, dec),
+                    "Yahoo raw prev close": money(q["fi_prev"], c, dec),
                     "Open": money(q["open"], c, dec),
                     "High": money(q["high"], c, dec),
+                    "Yahoo raw High": money(q["fi_high"], c, dec),
                     "Low": money(q["low"], c, dec),
+                    "Yahoo raw Low": money(q["fi_low"], c, dec),
                     "Session start": ("—" if q["session_start"] is None else
                                       f"{q['session_start'].tz_convert(zone):%d %b %H:%M} "
                                       f"{pd.Timestamp.now(tz=zone).tzname()}"),
@@ -426,7 +437,7 @@ def live_table():
                     "Method": q["src"],
                 })
             except Exception as e:
-                rows.append({"Name": inst["name"], "Yahoo ticker": inst["yf"],
+                rows.append({"Name": inst["name"], "Yahoo ticker": quote_ticker(inst),
                              "Contract priced": f"error: {e}"})
         st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch")
         st.caption(
