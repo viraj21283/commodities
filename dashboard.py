@@ -8,6 +8,7 @@ import yfinance as yf
 
 from common import INSTRUMENTS, tz
 
+ET = ZoneInfo("America/New_York")
 SMA_WINDOWS = (20, 89, 200)
 RSI_PERIOD = 14
 REFRESH_SECONDS = 15         # main table
@@ -44,9 +45,8 @@ def get_hourly(ticker: str) -> pd.Series:
     return h["Close"].dropna()
 
 
-@st.cache_data(ttl=REFRESH_SECONDS, show_spinner=False)
-def get_quote(ticker: str) -> dict:
-    """Latest quote fields, with fallback to daily history."""
+def _fast_info_quote(ticker: str) -> dict:
+    """Yahoo's own quote fields (calendar-day based), with fallback to daily history."""
     t = yf.Ticker(ticker)
     q = {"ltp": None, "prev": None, "open": None, "high": None, "low": None}
     try:
@@ -74,22 +74,96 @@ def get_quote(ticker: str) -> dict:
 
 
 @st.cache_data(ttl=REFRESH_SECONDS, show_spinner=False)
-def get_quote_time(ticker: str):
-    """Timestamp (tz-aware) of the most recent 1-minute bar, or None."""
+def get_intraday(ticker: str) -> pd.DataFrame:
+    """Recent 1-minute bars (tz-aware index)."""
     t = yf.Ticker(ticker)
-    for period in ("1d", "5d"):
+    for period in ("2d", "5d"):
         try:
-            h = t.history(period=period, interval="1m")
-            if not h.empty:
-                ts = h.index[-1]
-                return ts.tz_localize("UTC") if ts.tzinfo is None else ts
+            h = t.history(period=period, interval="1m", auto_adjust=False)
         except Exception:
             continue
-    return None
+        if h is not None and not h.empty and "Close" in h:
+            h = h.dropna(subset=["Close"])
+            if not h.empty:
+                if h.index.tz is None:
+                    h.index = h.index.tz_localize("UTC")
+                return h[["Open", "High", "Low", "Close"]]
+    return pd.DataFrame()
+
+
+def _session_quote(ticker: str):
+    """Quote for CME/NYMEX futures built from the exchange trading session.
+
+    Session = 6 PM ET (previous evening) to 5 PM ET. Open/High/Low come from 1-minute
+    bars in the current session, LTP is the latest bar, and the previous close is the
+    previous trading day's daily-bar close (the exchange settlement price).
+    """
+    bars = get_intraday(ticker)
+    if bars.empty:
+        return None
+    last_ts = bars.index[-1].tz_convert(ET)
+    start = last_ts.replace(hour=18, minute=0, second=0, microsecond=0)
+    if last_ts < start:
+        start = start - pd.DateOffset(days=1)
+    sess = bars[bars.index >= start]
+    if sess.empty:
+        sess = bars.tail(1)
+    trade_date = (start + pd.DateOffset(days=1)).date()
+
+    out = {
+        "ltp": float(sess["Close"].iloc[-1]),
+        "open": float(sess["Open"].iloc[0]),
+        "high": float(sess["High"].max()),
+        "low": float(sess["Low"].min()),
+        "src": "1-min bars (session) + daily settlement",
+        "session_start": start,
+        "last_bar": bars.index[-1],
+    }
+    daily = get_daily(ticker)
+    if len(daily):
+        mask = daily.index.date < trade_date
+        if mask.any():
+            out["prev"] = float(daily[mask].iloc[-1])
+    return out
+
+
+@st.cache_data(ttl=REFRESH_SECONDS, show_spinner=False)
+def get_quote(ticker: str, cme: bool = False) -> dict:
+    """Latest quote. CME/NYMEX futures use session-based values; others use Yahoo's fields."""
+    q = _fast_info_quote(ticker)
+    q.update({"src": "Yahoo fast_info", "session_start": None, "last_bar": None,
+              "fi_prev": q["prev"]})
+    if cme:
+        try:
+            sess = _session_quote(ticker)
+        except Exception:
+            sess = None
+        if sess:
+            q.update({k: v for k, v in sess.items() if v is not None})
+    if q["last_bar"] is None:
+        bars = get_intraday(ticker)
+        q["last_bar"] = bars.index[-1] if not bars.empty else None
+    return q
+
+
+def get_quote_time(ticker: str):
+    """Timestamp (tz-aware) of the most recent 1-minute bar, or None."""
+    bars = get_intraday(ticker)
+    return None if bars.empty else bars.index[-1]
+
+
+@st.cache_data(ttl=21600, show_spinner=False)
+def get_contract_name(ticker: str) -> str:
+    """Contract Yahoo is pricing, e.g. 'Silver Dec 26'."""
+    try:
+        info = yf.Ticker(ticker).info
+        return info.get("shortName") or info.get("longName") or "—"
+    except Exception:
+        return "—"
 
 
 def get_snapshot(inst: dict) -> dict:
-    q = get_quote(inst["yf"])
+    q = get_quote(inst["yf"], bool(inst.get("cme", False)))
 
     def num(v):
         return None if v is None or pd.isna(v) else float(v)
@@ -317,9 +391,49 @@ def live_table():
     units = " · ".join(f"{i['name']}: {i.get('unit', '')}" for i in INSTRUMENTS)
     st.caption(
         f"Front-month futures (USD/INR is the spot rate). Units: {units}. "
+        "For commodity futures, Open/High/Low cover the current exchange session (from "
+        "6 PM ET the evening before) and Previous Close is the prior settlement price. "
         "SMAs/RSI use daily closes with today's bar set to LTP. "
-        "RSI tint: green ≥ 60, red ≤ 40. Data: Yahoo Finance (may be delayed)."
+        "RSI tint: green ≥ 60, red ≤ 40. Data: Yahoo Finance, typically delayed about "
+        "10+ minutes, so it can trail real-time quotes on other sites."
     )
+
+    if st.toggle("Show data check (compare with Investing.com or your broker)",
+                 key="data_check"):
+        rows = []
+        for inst in INSTRUMENTS:
+            try:
+                q = get_quote(inst["yf"], bool(inst.get("cme", False)))
+                c, dec = inst["ccy"], inst.get("dec", 2)
+                last = q["last_bar"]
+                age = ("—" if last is None else
+                       f"{(pd.Timestamp.now(tz='UTC') - last).total_seconds() / 60:.0f} min")
+                rows.append({
+                    "Name": inst["name"],
+                    "Yahoo ticker": inst["yf"],
+                    "Contract priced": get_contract_name(inst["yf"]),
+                    "LTP": money(q["ltp"], c, dec),
+                    "Previous close used": money(q["prev"], c, dec),
+                    "Yahoo prev close (raw)": money(q["fi_prev"], c, dec),
+                    "Open": money(q["open"], c, dec),
+                    "High": money(q["high"], c, dec),
+                    "Low": money(q["low"], c, dec),
+                    "Session start": ("—" if q["session_start"] is None else
+                                      f"{q['session_start'].tz_convert(zone):%d %b %H:%M} "
+                                      f"{pd.Timestamp.now(tz=zone).tzname()}"),
+                    "Last 1-min bar": fmt_time(last, zone),
+                    "Age": age,
+                    "Method": q["src"],
+                })
+            except Exception as e:
+                rows.append({"Name": inst["name"], "Yahoo ticker": inst["yf"],
+                             "Contract priced": f"error: {e}"})
+        st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch")
+        st.caption(
+            "Check that 'Contract priced' is the same contract month you are comparing "
+            "against (e.g. Silver Dec 26 = SIZ6), and that 'Age' is small. Values from "
+            "different times or contracts will not match."
+        )
 
 
 @st.fragment(run_every=TECH_REFRESH_SECONDS)
