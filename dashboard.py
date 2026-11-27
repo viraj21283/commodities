@@ -2,6 +2,8 @@
 
 from zoneinfo import ZoneInfo
 
+from concurrent.futures import ThreadPoolExecutor
+
 import pandas as pd
 import streamlit as st
 import yfinance as yf
@@ -45,6 +47,17 @@ def get_hourly(ticker: str) -> pd.Series:
     return h["Close"].dropna()
 
 
+MONTH_CODES = "FGHJKMNQUVXZ"
+MONTH_NAMES = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
+
+
+def _num(v):
+    try:
+        return None if v is None or pd.isna(v) else float(v)
+    except Exception:
+        return None
+
+
 def _fast_info_quote(ticker: str) -> dict:
     """Yahoo's own quote fields (calendar-day based), with fallback to daily history."""
     t = yf.Ticker(ticker)
@@ -70,12 +83,93 @@ def _fast_info_quote(ticker: str) -> dict:
             q["open"] = q["open"] if pd.notna(q["open"]) else last["Open"]
             q["high"] = q["high"] if pd.notna(q["high"]) else last["High"]
             q["low"] = q["low"] if pd.notna(q["low"]) else last["Low"]
-    return q
+    return {k: _num(v) for k, v in q.items()}
 
 
+# ---------------------------------------------------------------------------
+# Contract detection: Yahoo's continuous tickers (GC=F, SI=F ...) can point at a different
+# contract month than the one other sites show. We price the most actively traded month.
+# ---------------------------------------------------------------------------
+def candidate_tickers(inst: dict, n: int = 5) -> list:
+    now = pd.Timestamp.now(tz="UTC")
+    y, m, out = now.year, now.month, []
+    while len(out) < n:
+        if m in inst["months"]:
+            out.append(f"{inst['root']}{MONTH_CODES[m - 1]}{y % 100:02d}.{inst['exch']}")
+        m += 1
+        if m > 12:
+            m, y = 1, y + 1
+    return out
+
+
+def _volume_info(ticker: str):
+    try:
+        h = yf.Ticker(ticker).history(period="10d", interval="1d", auto_adjust=False)
+        h = h.dropna(subset=["Close"])
+        if h.empty:
+            return None
+        vols = h["Volume"].fillna(0)
+        recent = vols.iloc[-4:-1] if len(vols) >= 2 else vols.iloc[-1:]
+        return {"last": h.index[-1].date(), "vol": float(recent.mean())}
+    except Exception:
+        return None
+
+
+def _contract_label(ticker: str) -> str:
+    code, yy = ticker[2], ticker.split(".")[0][3:]
+    return f"{MONTH_NAMES[MONTH_CODES.index(code)]} {yy}"
+
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def resolve_contracts() -> dict:
+    """{instrument name: {ticker, symbol, label, detail}} for CME/NYMEX products."""
+    jobs = {i["name"]: candidate_tickers(i) for i in INSTRUMENTS if i.get("root")}
+    flat = sorted({t for ts in jobs.values() for t in ts})
+    if not flat:
+        return {}
+    with ThreadPoolExecutor(max_workers=8) as ex:
+        info = dict(zip(flat, ex.map(_volume_info, flat)))
+
+    out = {}
+    for name, cands in jobs.items():
+        found = [(t, info[t]) for t in cands if info.get(t)]
+        if not found:
+            continue
+        newest = max(i["last"] for _, i in found)
+        live = [(t, i) for t, i in found if (newest - i["last"]).days <= 1]
+        best = max(live, key=lambda x: x[1]["vol"])      # ties -> nearest month
+        out[name] = {
+            "ticker": best[0],
+            "symbol": best[0].split(".")[0],
+            "label": _contract_label(best[0]),
+            "detail": ", ".join(f"{t.split('.')[0]}: {i['vol']:,.0f}" for t, i in live),
+        }
+    return out
+
+
+def quote_ticker(inst: dict) -> str:
+    """Ticker used for live quote values: a pinned contract ("quote" in common.py), else the
+    auto-detected active contract, else Yahoo's continuous front-month ticker."""
+    if inst.get("quote"):
+        return inst["quote"]
+    if inst.get("root"):
+        c = resolve_contracts().get(inst["name"])
+        if c:
+            return c["ticker"]
+    return inst["yf"]
+
+
+def display_symbol(inst: dict) -> str:
+    qt = quote_ticker(inst)
+    return qt.split(".")[0] if inst.get("root") and qt != inst["yf"] else inst["symbol"]
+
+
+# ---------------------------------------------------------------------------
+# Quotes
+# ---------------------------------------------------------------------------
 @st.cache_data(ttl=REFRESH_SECONDS, show_spinner=False)
-def get_intraday(ticker: str) -> pd.DataFrame:
-    """Recent 1-minute bars (tz-aware index)."""
+def get_intraday(ticker: str) -> dict:
+    """Recent 1-minute bars (tz-aware index) plus Yahoo's chart metadata."""
     t = yf.Ticker(ticker)
     for period in ("2d", "5d"):
         try:
@@ -87,20 +181,17 @@ def get_intraday(ticker: str) -> pd.DataFrame:
             if not h.empty:
                 if h.index.tz is None:
                     h.index = h.index.tz_localize("UTC")
-                return h[["Open", "High", "Low", "Close"]]
-    return pd.DataFrame()
+                try:
+                    meta = dict(t.history_metadata or {})
+                except Exception:
+                    meta = {}
+                return {"bars": h[["Open", "High", "Low", "Close"]], "meta": meta}
+    return {"bars": pd.DataFrame(), "meta": {}}
 
 
-def _session_quote(ticker: str):
-    """Quote for CME/NYMEX futures built from the exchange trading session.
-
-    Session = 6 PM ET (previous evening) to 5 PM ET. Open/High/Low come from 1-minute
-    bars in the current session, LTP is the latest bar, and the previous close is the
-    previous trading day's daily-bar close (the exchange settlement price).
-    """
-    bars = get_intraday(ticker)
-    if bars.empty:
-        return None
+def _session_values(bars: pd.DataFrame, ticker: str):
+    """Open/High/Low of the current exchange session (6 PM ET to 5 PM ET) and the previous
+    trading day's settlement (daily-bar close)."""
     last_ts = bars.index[-1].tz_convert(ET)
     start = last_ts.replace(hour=18, minute=0, second=0, microsecond=0)
     if last_ts < start:
@@ -110,15 +201,8 @@ def _session_quote(ticker: str):
         sess = bars.tail(1)
     trade_date = (start + pd.DateOffset(days=1)).date()
 
-    out = {
-        "ltp": float(sess["Close"].iloc[-1]),
-        "open": float(sess["Open"].iloc[0]),
-        "high": float(sess["High"].max()),
-        "low": float(sess["Low"].min()),
-        "src": "1-min bars (session) + daily settlement",
-        "session_start": start,
-        "last_bar": bars.index[-1],
-    }
+    out = {"open": float(sess["Open"].iloc[0]), "high": float(sess["High"].max()),
+           "low": float(sess["Low"].min()), "session_start": start}
     daily = get_daily(ticker)
     if len(daily):
         mask = daily.index.date < trade_date
@@ -129,28 +213,57 @@ def _session_quote(ticker: str):
 
 @st.cache_data(ttl=REFRESH_SECONDS, show_spinner=False)
 def get_quote(ticker: str, cme: bool = False) -> dict:
-    """Latest quote. CME/NYMEX futures use session-based values; others use Yahoo's fields."""
-    q = _fast_info_quote(ticker)
-    q.update({"src": "Yahoo fast_info", "session_start": None, "last_bar": None,
-              "fi_prev": q["prev"], "fi_ltp": q["ltp"], "fi_high": q["high"],
-              "fi_low": q["low"]})
-    if cme:
+    """Latest quote.
+
+    LTP is Yahoo's live price. For CME/NYMEX futures the previous close is the prior
+    settlement and the day's range spans the whole exchange session (union of 1-minute bars
+    and Yahoo's own day high/low)."""
+    raw = _fast_info_quote(ticker)
+    data = get_intraday(ticker)
+    bars, meta = data["bars"], data["meta"]
+
+    bar_ts = bars.index[-1] if not bars.empty else None
+    meta_ts = None
+    if _num(meta.get("regularMarketTime")) is not None:
+        meta_ts = pd.Timestamp(int(meta["regularMarketTime"]), unit="s", tz="UTC")
+    stamps = [t for t in (bar_ts, meta_ts) if t is not None]
+
+    ltp = raw["ltp"]
+    if ltp is None:
+        ltp = _num(meta.get("regularMarketPrice"))
+    if ltp is None and not bars.empty:
+        ltp = float(bars["Close"].iloc[-1])
+
+    q = {
+        "ltp": ltp, "prev": raw["prev"], "open": raw["open"], "high": raw["high"],
+        "low": raw["low"], "src": "Yahoo fast_info", "session_start": None,
+        "last_bar": max(stamps) if stamps else None,
+        "fi_prev": raw["prev"], "fi_ltp": raw["ltp"], "fi_high": raw["high"],
+        "fi_low": raw["low"],
+        "bar_ltp": float(bars["Close"].iloc[-1]) if not bars.empty else None,
+    }
+
+    if cme and not bars.empty:
         try:
-            sess = _session_quote(ticker)
+            s = _session_values(bars, ticker)
         except Exception:
-            sess = None
-        if sess:
-            q.update({k: v for k, v in sess.items() if v is not None})
-    if q["last_bar"] is None:
-        bars = get_intraday(ticker)
-        q["last_bar"] = bars.index[-1] if not bars.empty else None
+            s = None
+        if s:
+            highs = [v for v in (s["high"], raw["high"], _num(meta.get("regularMarketDayHigh")),
+                                 ltp) if v is not None]
+            lows = [v for v in (s["low"], raw["low"], _num(meta.get("regularMarketDayLow")),
+                                ltp) if v is not None]
+            q.update({"open": s["open"], "high": max(highs), "low": min(lows),
+                      "session_start": s["session_start"],
+                      "src": "Yahoo live price + exchange-session range/settlement"})
+            if s.get("prev") is not None:
+                q["prev"] = s["prev"]
     return q
 
 
 def get_quote_time(ticker: str):
-    """Timestamp (tz-aware) of the most recent 1-minute bar, or None."""
-    bars = get_intraday(ticker)
-    return None if bars.empty else bars.index[-1]
+    """Timestamp (tz-aware) of Yahoo's latest data point for this ticker, or None."""
+    return get_quote(ticker, False)["last_bar"]
 
 
 @st.cache_data(ttl=21600, show_spinner=False)
@@ -163,19 +276,9 @@ def get_contract_name(ticker: str) -> str:
         return "—"
 
 
-def quote_ticker(inst: dict) -> str:
-    """Ticker used for live quote values. Set "quote" in common.py (e.g. "SIZ26.CMX") to pin
-    a specific contract month; otherwise Yahoo's continuous front-month ticker is used."""
-    return inst.get("quote") or inst["yf"]
-
-
 def get_snapshot(inst: dict) -> dict:
     q = get_quote(quote_ticker(inst), bool(inst.get("cme", False)))
-
-    def num(v):
-        return None if v is None or pd.isna(v) else float(v)
-
-    snap = {k: num(q[k]) for k in ("ltp", "prev", "open", "high", "low")}
+    snap = {k: q[k] for k in ("ltp", "prev", "open", "high", "low")}
     if snap["ltp"] is None or snap["prev"] is None:
         raise ValueError(f"Yahoo returned no price data for {inst['yf']}")
     return snap
@@ -305,7 +408,7 @@ def build_main_table():
         d = r["inst"].get("dec", 2)
         disp.append({
             "Name": r["inst"]["name"],
-            "Symbol": r["inst"]["symbol"],
+            "Symbol": display_symbol(r["inst"]),
             "Previous Close": money(r["prev"], c, d),
             "LTP": money(r["ltp"], c, d),
             "Change": signed_money(r["change"], c, d),
@@ -432,9 +535,13 @@ def live_table():
                     "Session start": ("—" if q["session_start"] is None else
                                       f"{q['session_start'].tz_convert(zone):%d %b %H:%M} "
                                       f"{pd.Timestamp.now(tz=zone).tzname()}"),
-                    "Last 1-min bar": fmt_time(last, zone),
+                    "1-min bar LTP": money(q["bar_ltp"], c, dec),
+                    "Last data point": fmt_time(last, zone),
                     "Age": age,
                     "Method": q["src"],
+                    "Contract choice (avg daily volume)": (
+                        (resolve_contracts().get(inst["name"]) or {}).get("detail", "continuous ticker")
+                        if not inst.get("quote") else "pinned"),
                 })
             except Exception as e:
                 rows.append({"Name": inst["name"], "Yahoo ticker": quote_ticker(inst),
