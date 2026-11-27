@@ -14,9 +14,10 @@ from common import INSTRUMENTS, tz
 ET = ZoneInfo("America/New_York")
 SMA_WINDOWS = (20, 89, 200)
 RSI_PERIOD = 14
-REFRESH_SECONDS = 15         # main table
-TECH_REFRESH_SECONDS = 60    # technicals table
-STALE_MINUTES = 30           # flag quotes older than this
+DATA_TTL = 3600              # prices and bars are downloaded at most once an hour
+UI_REFRESH_SECONDS = 60      # cheap re-render (no downloads) so a new hourly update shows up
+TECH_REFRESH_SECONDS = 300   # technicals table re-render
+STALE_MINUTES = 30           # flag data that was already this old when it was downloaded
 
 TIMEFRAMES = ["1H", "2H", "4H", "Daily", "Weekly", "Monthly"]
 TF_LABELS = {"1H": "1 Hour", "2H": "2 Hours", "4H": "4 Hours",
@@ -101,34 +102,44 @@ def _dl_fast(t: str) -> dict:
 
 # Each batch fetches every instrument in parallel (one round trip instead of eight in a row),
 # so a refresh takes about a second and can never queue up behind slow requests.
-@st.cache_data(ttl=1800, show_spinner=False)
+@st.cache_data(ttl=DATA_TTL, show_spinner=False)
 def batch_daily(tickers: tuple) -> dict:
     return dict(zip(tickers, _pmap(_dl_daily_max, tickers)))
 
 
-@st.cache_data(ttl=120, show_spinner=False)
+@st.cache_data(ttl=DATA_TTL, show_spinner=False)
 def batch_hourly(tickers: tuple) -> dict:
     return dict(zip(tickers, _pmap(_dl_hourly, tickers)))
 
 
-@st.cache_data(ttl=600, show_spinner=False)
+@st.cache_data(ttl=DATA_TTL, show_spinner=False)
 def batch_recent_daily(tickers: tuple) -> dict:
     return dict(zip(tickers, _pmap(_dl_daily_recent, tickers)))
 
 
-@st.cache_data(ttl=REFRESH_SECONDS, show_spinner=False)
+@st.cache_data(ttl=DATA_TTL, show_spinner=False)
 def batch_intraday(tickers: tuple) -> dict:
-    return dict(zip(tickers, _pmap(_dl_intraday, tickers)))
+    out = dict(zip(tickers, _pmap(_dl_intraday, tickers)))
+    out["_fetched_at"] = pd.Timestamp.now(tz="UTC")      # when this download happened
+    return out
 
 
-@st.cache_data(ttl=REFRESH_SECONDS, show_spinner=False)
+@st.cache_data(ttl=DATA_TTL, show_spinner=False)
 def batch_fast(tickers: tuple) -> dict:
     return dict(zip(tickers, _pmap(_dl_fast, tickers)))
 
 
 def clear_quote_cache():
+    """Manual refresh: forget downloaded prices so the next render downloads fresh data."""
     batch_intraday.clear()
     batch_fast.clear()
+    batch_hourly.clear()
+    batch_recent_daily.clear()
+
+
+def last_refreshed():
+    """Timestamp (UTC) of the last download of live prices."""
+    return batch_intraday(quote_tickers()).get("_fetched_at")
 
 
 def series_tickers() -> tuple:
@@ -241,7 +252,7 @@ def _contract_label(ticker: str) -> str:
     return f"{MONTH_NAMES[MONTH_CODES.index(code)]} {yy}"
 
 
-@st.cache_data(ttl=1800, show_spinner=False)
+@st.cache_data(ttl=DATA_TTL, show_spinner=False)
 def resolve_contracts() -> dict:
     """{instrument name: {ticker, symbol, label, detail}} for CME/NYMEX products."""
     jobs = {i["name"]: candidate_tickers(i) for i in INSTRUMENTS if i.get("root")}
@@ -311,7 +322,7 @@ def _session_values(bars: pd.DataFrame, ticker: str):
 
 
 def get_quote(ticker: str, cme: bool = False) -> dict:
-    """Latest quote (all underlying downloads are cached for REFRESH_SECONDS).
+    """Latest quote (all underlying downloads are cached for DATA_TTL).
 
     LTP is Yahoo's live price. For CME/NYMEX futures the previous close is the prior
     settlement and the day's range spans the whole exchange session (union of 1-minute bars
@@ -470,11 +481,12 @@ def signed_money(v, ccy, dec=2):
     return f"-{ccy}{abs(v):,.{dec}f}" if v < 0 else f"{ccy}{v:,.{dec}f}"
 
 
-def fmt_time(ts, zone: ZoneInfo) -> str:
+def fmt_time(ts, zone: ZoneInfo, ref=None) -> str:
+    """Local time of a data point; flagged when it was already stale at download time."""
     if ts is None:
         return "—"
     local = ts.tz_convert(zone)
-    age_min = (pd.Timestamp.now(tz="UTC") - ts).total_seconds() / 60
+    age_min = ((ref if ref is not None else pd.Timestamp.now(tz="UTC")) - ts).total_seconds() / 60
     flag = " ⚠" if age_min > STALE_MINUTES else ""
     return f"{local:%d %b %H:%M:%S} {local.tzname()}{flag}"
 
@@ -525,7 +537,7 @@ def build_main_table():
             "89-SMA": money(r["sma89"], c, d),
             "200-SMA": money(r["sma200"], c, d),
             "Daily RSI": "—" if r["rsi"] is None else f"{r['rsi']:.1f}",
-            time_col: fmt_time(r["qtime"], zone),
+            time_col: fmt_time(r["qtime"], zone, last_refreshed()),
         })
         rsi_num.append(r["rsi"] if r["rsi"] is not None else float("nan"))
         chg_num.append(r["change"])
@@ -585,40 +597,39 @@ def build_technicals() -> dict:
 st.title("Commodities Futures Dashboard")
 
 
-@st.fragment(run_every=REFRESH_SECONDS)
+@st.fragment(run_every=UI_REFRESH_SECONDS)
 def live_table():
-    started = time.time()
     try:
         disp, nums = build_main_table()
     except Exception:
-        # never let one bad refresh stop the auto-refresh timer
-        st.warning("Prices could not be refreshed just now; retrying automatically.")
+        st.warning("Prices could not be loaded just now; retrying automatically.")
         return
     if disp is None:
         st.error("No data available right now.")
         return
-    took = time.time() - started
     st.dataframe(style_main(disp, nums), hide_index=True, width="stretch")
-    st.button("Refresh now", key="refresh_now", on_click=clear_quote_cache)
+    st.button("🔄 Refresh now", key="refresh_now", on_click=clear_quote_cache)
 
     zone = tz()
-    now = pd.Timestamp.now(tz="UTC")
-    clocks = " · ".join(
-        f"{now.tz_convert(z):%H:%M:%S} {now.tz_convert(z).tzname()}"
-        for z in (zone, ZoneInfo("UTC"), ZoneInfo("America/New_York"))
-    )
-    st.caption(
-        f"Last refresh: {clocks} (took {took:.1f}s) · auto-refreshes every {REFRESH_SECONDS}s · "
-        f"⚠ = last quote older than {STALE_MINUTES} min (market may be closed)"
-    )
+    fetched = last_refreshed()
+    if fetched is not None:
+        asof = fetched.tz_convert(zone)
+        nxt = (fetched + pd.Timedelta(seconds=DATA_TTL)).tz_convert(zone)
+        st.caption(
+            f"Prices downloaded {asof:%d %b %H:%M:%S} {asof.tzname()} · updates automatically "
+            f"every hour (next around {nxt:%H:%M}) or press Refresh now · "
+            f"⚠ = Yahoo's last quote was already older than {STALE_MINUTES} min when "
+            "downloaded (market may be closed)"
+        )
     units = " · ".join(f"{i['name']}: {i.get('unit', '')}" for i in INSTRUMENTS)
     st.caption(
         f"Front-month futures (USD/INR is the spot rate). Units: {units}. "
         "For commodity futures, Open/High/Low cover the current exchange session (from "
         "6 PM ET the evening before) and Previous Close is the prior settlement price. "
         "SMAs/RSI use daily closes with today's bar set to LTP. "
-        "RSI tint: green ≥ 60, red ≤ 40. Data: Yahoo Finance, typically delayed about "
-        "10+ minutes, so it can trail real-time quotes on other sites."
+        "RSI tint: green ≥ 60, red ≤ 40. Data: Yahoo Finance (itself delayed about 10+ "
+        "minutes), downloaded hourly, so prices can be over an hour behind live quotes "
+        "elsewhere."
     )
 
     if st.toggle("Show data check (compare with Investing.com or your broker)",
@@ -630,8 +641,9 @@ def live_table():
                 q = get_quote(qt, bool(inst.get("cme", False)))
                 c, dec = inst["ccy"], inst.get("dec", 2)
                 last = q["last_bar"]
-                age = ("—" if last is None else
-                       f"{(pd.Timestamp.now(tz='UTC') - last).total_seconds() / 60:.0f} min")
+                ref = last_refreshed()
+                age = ("—" if last is None or ref is None else
+                       f"{(ref - last).total_seconds() / 60:.0f} min (at download)")
                 rows.append({
                     "Name": inst["name"],
                     "Yahoo ticker": qt,
@@ -649,7 +661,7 @@ def live_table():
                                       f"{q['session_start'].tz_convert(zone):%d %b %H:%M} "
                                       f"{pd.Timestamp.now(tz=zone).tzname()}"),
                     "1-min bar LTP": money(q["bar_ltp"], c, dec),
-                    "Last data point": fmt_time(last, zone),
+                    "Last data point": fmt_time(last, zone, last_refreshed()),
                     "Age": age,
                     "Method": q["src"],
                     "Contract choice (avg daily volume)": (
