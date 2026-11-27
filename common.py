@@ -15,17 +15,17 @@ TIMEZONES = ["Asia/Kolkata", "UTC", "America/New_York", "Europe/London"]
 # unit   : quoted unit
 # news   : Google News search query used on the News page
 INSTRUMENTS = [
-    {"name": "Gold", "symbol": "GC", "yf": "GC=F", "ccy": "$", "dec": 2,
+    {"name": "Gold", "symbol": "GC", "yf": "GC=F", "cme": True, "ccy": "$", "dec": 2,
      "unit": "USD per troy oz", "news": 'gold price OR "gold futures"'},
-    {"name": "Silver", "symbol": "SI", "yf": "SI=F", "ccy": "$", "dec": 2,
+    {"name": "Silver", "symbol": "SI", "yf": "SI=F", "cme": True, "ccy": "$", "dec": 3,
      "unit": "USD per troy oz", "news": 'silver price OR "silver futures"'},
-    {"name": "WTI Crude", "symbol": "CL", "yf": "CL=F", "ccy": "$", "dec": 2,
+    {"name": "WTI Crude", "symbol": "CL", "yf": "CL=F", "cme": True, "ccy": "$", "dec": 2,
      "unit": "USD per barrel", "news": '"WTI crude" OR "crude oil prices"'},
-    {"name": "Brent Crude", "symbol": "BZ", "yf": "BZ=F", "ccy": "$", "dec": 2,
+    {"name": "Brent Crude", "symbol": "BZ", "yf": "BZ=F", "cme": True, "ccy": "$", "dec": 2,
      "unit": "USD per barrel", "news": '"Brent crude" OR "Brent oil"'},
-    {"name": "Natural Gas", "symbol": "NG", "yf": "NG=F", "ccy": "$", "dec": 2,
+    {"name": "Natural Gas", "symbol": "NG", "yf": "NG=F", "cme": True, "ccy": "$", "dec": 3,
      "unit": "USD per MMBtu", "news": '"natural gas futures" OR "natural gas prices"'},
-    {"name": "Copper", "symbol": "HG", "yf": "HG=F", "ccy": "$", "dec": 2,
+    {"name": "Copper", "symbol": "HG", "yf": "HG=F", "cme": True, "ccy": "$", "dec": 4,
      "unit": "USD per lb", "news": '"copper price" OR "copper futures"'},
     {"name": "Dollar Index (DXY)", "symbol": "DX", "yf": "DX-Y.NYB", "ccy": "", "dec": 3,
      "unit": "index points", "news": '"dollar index" OR DXY'},
